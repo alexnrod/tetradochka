@@ -1,0 +1,23 @@
+services:
+  bot:
+    # Built by .github/workflows/deploy.yml and loaded with `docker load`; never pulled.
+    image: tetradochka-bot:latest
+    pull_policy: never
+    restart: unless-stopped
+    env_file: .env
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+      - bot_data:/data
+
+volumes:
+  bot_data:
+
+networks:
+  default:
+    driver_opts:
+      # The VM's ens3 has MTU 1450; Docker's default 1500 stalls large TLS responses.
+      com.docker.network.driver.mtu: "1450"

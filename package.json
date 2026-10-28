@@ -1,0 +1,19 @@
+{
+  "name": "tetradochka",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/main.ts",
+    "lint": "tsc --noEmit",
+    "test": "node --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^6.0.3"
+  },
+  "packageManager": "pnpm@12.15.0"
+}

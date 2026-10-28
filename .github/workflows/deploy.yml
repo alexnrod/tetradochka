@@ -1,0 +1,48 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency: deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Lint and test
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm lint
+          pnpm test
+
+      - name: Build image
+        run: docker build -t tetradochka-bot:latest .
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host prod\n  HostName %s\n  User root\n  IdentityFile ~/.ssh/id_deploy\n' "$DEPLOY_HOST" > ~/.ssh/config
+
+      - name: Ship image
+        run: docker save tetradochka-bot:latest | gzip | ssh prod 'gunzip | docker load'
+
+      - name: Restart stack
+        run: |
+          scp docker-compose-production.yml prod:/opt/tetradochka/
+          ssh prod 'cd /opt/tetradochka && docker compose -f docker-compose-production.yml up -d --remove-orphans && docker image prune -f'
