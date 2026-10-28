@@ -10,13 +10,27 @@ The bot runs on the insurance-portal VM (`95.163.231.103`) as its own Docker Com
 
 ## Telegram API access
 
-The VM is in Russia. The IP that DNS returns for `api.telegram.org` (149.154.166.110) is blocked, so `docker-compose-production.yml` pins the host to 149.154.167.220 with `extra_hosts`. If the bot logs `ETIMEDOUT` again, check from the VM which Telegram IP still answers:
+The VM is in Russia, where Telegram is blocked. Measured from the VM on 28 Oct 2026:
+
+| Target | Result |
+|---|---|
+| 149.154.166.110 (DNS answer for `api.telegram.org`) | TCP blocked |
+| 149.154.167.220 | Reachable, 19 of 20 requests succeed |
+| 149.154.167.99, 149.154.175.50, 91.108.56.130 | Blocked |
+
+`docker-compose-production.yml` pins `api.telegram.org` to 149.154.167.220 with `extra_hosts`. TLS still checks the `api.telegram.org` certificate.
+
+Some connections stall without an error. The bot caps each API request at 40 seconds and grammY retries failed polls, so a stall delays replies by up to 40 seconds.
+
+If the bot logs `ETIMEDOUT` again, check from the VM which Telegram IP still answers and update `extra_hosts`:
 
 ```bash
 curl -s -m 8 --resolve api.telegram.org:443:<ip> -o /dev/null -w '%{http_code}\n' https://api.telegram.org/bot/getMe
 ```
 
 A `404` means the API is reachable at that IP.
+
+If no Telegram IP answers or stalls become frequent, move the bot to a host outside Russia. The bot needs only outbound HTTPS, Docker and the SQLite volume. Back up the database as in [Operations](#operations), change `DEPLOY_HOST` and `DEPLOY_KNOWN_HOSTS`, create `.env` on the new host, restore the database into the `tetradochka_bot_data` volume and remove `extra_hosts`.
 
 ## Pipeline
 
