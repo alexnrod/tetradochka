@@ -60,6 +60,12 @@ function pager(prefix: string, p: Page): InlineKeyboard {
   return kb.row();
 }
 
+// Short error text for logs. The full grammY error embeds the request URL, which contains the bot token.
+export function describeError(error: unknown): string {
+  const cause = (error as { error?: { code?: string } })?.error?.code;
+  return cause ? `${error} (${cause})` : String(error);
+}
+
 // Splits "@login some reason" into the login (undefined if invalid) and the reason.
 function parseArgs(match: string): { first: string; username?: string; reason: string } {
   const [first = "", ...rest] = match.trim().split(/\s+/);
@@ -67,7 +73,9 @@ function parseArgs(match: string): { first: string; username?: string; reason: s
 }
 
 export function createBot(token: string, ownerId: number, notebook: Notebook, botInfo?: Bot["botInfo"]): Bot {
-  const bot = new Bot(token, { botInfo });
+  // Some connections to Telegram from the VM stall silently; grammY's default 500-second timeout would freeze the bot.
+  // Long polling waits up to 30 seconds, so 40 seconds still covers a full poll.
+  const bot = new Bot(token, { botInfo, client: { timeoutSeconds: 40 } });
   let step: Step | undefined;
 
   const html = (ctx: Context, text: string, keyboard?: InlineKeyboard) =>
@@ -259,7 +267,7 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
 
   bot.callbackQuery("noop", (ctx) => ctx.answerCallbackQuery());
 
-  bot.catch((err) => console.error("Update failed", err.error));
+  bot.catch((err) => console.error("Update failed:", describeError(err.error)));
 
   return bot;
 }

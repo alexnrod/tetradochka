@@ -12,7 +12,7 @@ Private Telegram bot that keeps a list of people by their Telegram login. Each e
 
 `/add @login reason` and `/remove @login reason` skip the questions. A removed person stays in the history and can be added again. Reasons are capped at 300 characters so a page fits into one Telegram message.
 
-The look follows `design.html`. The avatar is `assets/avatar.jpg` (rendered from `assets/avatar.svg`) and is set once through the Bot API:
+The look follows `design.html`. The avatar is `assets/avatar.jpg`, a 640×640 JPEG of `assets/icon.png` on white, set once through the Bot API:
 
 ```bash
 curl -F 'photo={"type":"static","photo":"attach://avatar"}' -F avatar=@assets/avatar.jpg \
