@@ -16,6 +16,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
+          # Auto-caching for the packageManager field needs pnpm before corepack enables it.
+          package-manager-cache: false
 
       - name: Lint and test
         run: |
