@@ -8,6 +8,16 @@ The bot runs on the insurance-portal VM (`95.163.231.103`) as its own Docker Com
 | Compose file | `docker-compose-production.yml` |
 | Database | `/data/tetradochka.db` in the `tetradochka_bot_data` volume |
 
+## Telegram API access
+
+The VM is in Russia. The IP that DNS returns for `api.telegram.org` (149.154.166.110) is blocked, so `docker-compose-production.yml` pins the host to 149.154.167.220 with `extra_hosts`. If the bot logs `ETIMEDOUT` again, check from the VM which Telegram IP still answers:
+
+```bash
+curl -s -m 8 --resolve api.telegram.org:443:<ip> -o /dev/null -w '%{http_code}\n' https://api.telegram.org/bot/getMe
+```
+
+A `404` means the API is reachable at that IP.
+
 ## Pipeline
 
 `.github/workflows/deploy.yml` runs on every push to `main` and on manual dispatch:

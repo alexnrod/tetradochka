@@ -5,6 +5,9 @@ services:
     pull_policy: never
     restart: unless-stopped
     env_file: .env
+    # The VM is in Russia, where the IP that DNS returns for api.telegram.org is blocked; this Telegram API address is reachable.
+    extra_hosts:
+      - api.telegram.org:149.154.167.220
     logging:
       driver: json-file
       options:
