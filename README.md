@@ -4,12 +4,22 @@ Private Telegram bot that keeps a list of people by their Telegram login. Each e
 
 | Command | Action |
 |---|---|
-| `/add @login reason` | Add a person |
-| `/remove @login reason` | Remove a person |
-| `/list` | People currently in the notebook |
-| `/show @login` | Full history of a person, including removals |
+| `/start` | Greeting and main menu |
+| `/add` | Add a person: the bot asks for the login and the reason |
+| `/remove` | Remove a person: pick from buttons, give the reason, confirm |
+| `/list` | People currently in the notebook, 10 per page |
+| `/history` | Removed people with both reasons, newest first |
 
-A removed person stays in the history and can be added again.
+`/add @login reason` and `/remove @login reason` skip the questions. A removed person stays in the history and can be added again. Reasons are capped at 300 characters so a page fits into one Telegram message.
+
+The look follows `design.html`. The avatar is `assets/avatar.jpg` (rendered from `assets/avatar.svg`) and is set once through the Bot API:
+
+```bash
+curl -F 'photo={"type":"static","photo":"attach://avatar"}' -F avatar=@assets/avatar.jpg \
+  "https://api.telegram.org/bot$BOT_TOKEN/setMyProfilePhoto"
+```
+
+The bot sets its commands and description on every start.
 
 ## Stack
 

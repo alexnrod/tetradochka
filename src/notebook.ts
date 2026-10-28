@@ -78,10 +78,11 @@ export class Notebook {
     return rows.map(toEntry);
   }
 
-  history(username: string): Entry[] {
+  // Removed entries, most recently removed first.
+  removed(): Entry[] {
     const rows = this.#db
-      .prepare("SELECT * FROM entries WHERE username = ? ORDER BY added_at")
-      .all(username) as Row[];
+      .prepare("SELECT * FROM entries WHERE removed_at IS NOT NULL ORDER BY removed_at DESC")
+      .all() as Row[];
     return rows.map(toEntry);
   }
 

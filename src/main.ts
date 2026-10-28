@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { COMMANDS, createBot } from "./bot.ts";
+import { COMMANDS, DESCRIPTION, SHORT_DESCRIPTION, createBot } from "./bot.ts";
 import { Notebook } from "./notebook.ts";
 
 function requireEnv(name: string): string {
@@ -23,6 +23,8 @@ process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
 
 await bot.api.setMyCommands(COMMANDS);
+await bot.api.setMyDescription(DESCRIPTION);
+await bot.api.setMyShortDescription(SHORT_DESCRIPTION);
 // Long polling: the bot opens no ports. Messages sent during a deploy are processed after the restart.
 await bot.start({
   onStart: (me) => console.log(`Started as @${me.username}`),

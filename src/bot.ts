@@ -1,98 +1,265 @@
-import { Bot, type Context } from "grammy";
-import { type Entry, type Notebook, parseUsername } from "./notebook.ts";
+import { Bot, type Context, InlineKeyboard } from "grammy";
+import {
+  REASON_LIMIT,
+  activeCard,
+  addedCard,
+  escape,
+  historyPage,
+  listPage,
+  removedCard,
+  type Page,
+} from "./format.ts";
+import { type Notebook, parseUsername } from "./notebook.ts";
 
-const HELP = `Моя тетрадочка
+export const DESCRIPTION =
+  "Записывай людей по логину в Telegram — с датой и причиной. Вычёркивай тоже с причиной: история помнит, кого и почему убрали из тетрадочки.";
+export const SHORT_DESCRIPTION = "Люди по логину в Telegram — с датой и причиной.";
 
-/add @логин причина — добавить человека
-/remove @логин причина — удалить человека
-/list — кто сейчас в тетрадочке
-/show @логин — вся история по человеку`;
+export const COMMANDS = [
+  { command: "start", description: "Открыть тетрадочку и главное меню" },
+  { command: "add", description: "Записать человека: логин и почему" },
+  { command: "remove", description: "Вычеркнуть человека и объяснить причину" },
+  { command: "list", description: "Кто сейчас в тетрадочке" },
+  { command: "history", description: "Все вычеркнутые — когда и почему" },
+];
 
-// Telegram rejects messages longer than 4096 characters.
-const MESSAGE_LIMIT = 4000;
+const GREETING = "Привет! Это твоя тетрадочка. Записывай сюда людей и вычёркивай их — всегда с датой и причиной.";
+const ASK_ADD_LOGIN = "Кого записываем? Пришли логин в Telegram, например @username";
+const NOT_A_LOGIN = "Не похоже на логин. Пришли его в виде @username";
+const TOO_LONG = `Слишком длинно. Уложись в ${REASON_LIMIT} символов.`;
+const PICK_LIMIT = 20;
 
-const dateFormat = new Intl.DateTimeFormat("ru-RU", {
-  dateStyle: "medium",
-  timeStyle: "short",
-  timeZone: process.env.TZ,
-});
-const formatDate = (iso: string) => dateFormat.format(new Date(iso));
+const askAddReason = (u: string) => `Почему записываем <code>@${u}</code>? Напиши пару слов.`;
+const askRemoveReason = (u: string) =>
+  `За что вычёркиваем <code>@${u}</code>? Причина останется в истории.`;
+const notInNotebook = (u: string) => `<code>@${u}</code> нет в тетрадочке.`;
 
-function formatEntry(e: Entry): string {
-  const lines = [`@${e.username}`, `  добавлен ${formatDate(e.addedAt)}: ${e.addReason}`];
-  if (e.removedAt) lines.push(`  удалён ${formatDate(e.removedAt)}: ${e.removeReason}`);
-  return lines.join("\n");
+// The step the owner is in while the bot waits for their next message.
+// Kept in memory: a restart only drops an unfinished dialog.
+type Step =
+  | { kind: "add-login" }
+  | { kind: "add-reason"; username: string }
+  | { kind: "remove-login" }
+  | { kind: "remove-reason"; username: string }
+  | { kind: "remove-confirm"; username: string; reason: string };
+
+const menu = () =>
+  new InlineKeyboard()
+    .text("➕ Записать", "add")
+    .text("➖ Вычеркнуть", "remove")
+    .row()
+    .text("📓 Тетрадочка", "list")
+    .text("🕓 История", "history");
+
+function pager(prefix: string, p: Page): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (p.pages === 1) return kb;
+  if (p.page > 1) kb.text("← Назад", `${prefix}:${p.page - 1}`);
+  kb.text(`стр. ${p.page} из ${p.pages}`, "noop");
+  if (p.page < p.pages) kb.text("Дальше →", `${prefix}:${p.page + 1}`);
+  return kb.row();
 }
 
-async function replyChunked(ctx: Context, blocks: string[]): Promise<void> {
-  let message = "";
-  for (const block of blocks) {
-    if (message && message.length + block.length + 2 > MESSAGE_LIMIT) {
-      await ctx.reply(message);
-      message = "";
-    }
-    message = message ? `${message}\n\n${block}` : block;
-  }
-  if (message) await ctx.reply(message);
-}
-
-// Splits "@login some reason" into the login and the reason.
-function parseArgs(match: string): { username?: string; reason: string } {
+// Splits "@login some reason" into the login (undefined if invalid) and the reason.
+function parseArgs(match: string): { first: string; username?: string; reason: string } {
   const [first = "", ...rest] = match.trim().split(/\s+/);
-  return { username: parseUsername(first), reason: rest.join(" ") };
+  return { first, username: parseUsername(first), reason: rest.join(" ") };
 }
 
-export function createBot(token: string, ownerId: number, notebook: Notebook): Bot {
-  const bot = new Bot(token);
+export function createBot(token: string, ownerId: number, notebook: Notebook, botInfo?: Bot["botInfo"]): Bot {
+  const bot = new Bot(token, { botInfo });
+  let step: Step | undefined;
+
+  const html = (ctx: Context, text: string, keyboard?: InlineKeyboard) =>
+    ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
 
   // The notebook is private: updates from anyone but the owner are dropped without a reply.
   bot.use(async (ctx, next) => {
     if (ctx.from?.id === ownerId) await next();
   });
 
-  bot.command(["start", "help"], (ctx) => ctx.reply(HELP));
-
-  bot.command("add", async (ctx) => {
-    const { username, reason } = parseArgs(ctx.match);
-    if (!username || !reason) return ctx.reply("Формат: /add @логин причина");
+  async function startAdd(ctx: Context, username?: string, reason?: string) {
+    if (!username) {
+      step = { kind: "add-login" };
+      return html(ctx, ASK_ADD_LOGIN);
+    }
     const existing = notebook.active(username);
-    if (existing) return ctx.reply(`Уже в тетрадочке:\n\n${formatEntry(existing)}`);
+    if (existing) {
+      step = undefined;
+      return html(ctx, activeCard(existing), new InlineKeyboard().text("📓 Тетрадочка", "list"));
+    }
+    if (!reason) {
+      step = { kind: "add-reason", username };
+      return html(ctx, askAddReason(username));
+    }
+    if (reason.length > REASON_LIMIT) {
+      step = { kind: "add-reason", username };
+      return html(ctx, TOO_LONG);
+    }
+    step = undefined;
     const entry = notebook.add(username, reason);
-    return ctx.reply(`Добавлен:\n\n${formatEntry(entry)}`);
+    return html(
+      ctx,
+      addedCard(entry),
+      new InlineKeyboard().text("📓 Тетрадочка", "list").text("➕ Ещё одного", "add"),
+    );
+  }
+
+  async function startRemove(ctx: Context, username?: string, reason?: string) {
+    if (!username) {
+      const active = notebook.list();
+      if (active.length === 0) {
+        step = undefined;
+        return html(ctx, "Тетрадочка пуста, вычёркивать некого.", new InlineKeyboard().text("➕ Записать", "add"));
+      }
+      step = { kind: "remove-login" };
+      const kb = new InlineKeyboard();
+      active.slice(0, PICK_LIMIT).forEach((e, i) => {
+        kb.text(`@${e.username}`, `pick:${e.username}`);
+        if (i % 2 === 1) kb.row();
+      });
+      const hint = active.length > PICK_LIMIT ? "\n\nВ кнопках не все — можно прислать логин сообщением." : "";
+      return html(ctx, `Кого вычёркиваем?${hint}`, kb);
+    }
+    if (!notebook.active(username)) {
+      step = undefined;
+      return html(ctx, notInNotebook(username));
+    }
+    if (!reason) {
+      step = { kind: "remove-reason", username };
+      return html(ctx, askRemoveReason(username));
+    }
+    if (reason.length > REASON_LIMIT) {
+      step = { kind: "remove-reason", username };
+      return html(ctx, TOO_LONG);
+    }
+    step = { kind: "remove-confirm", username, reason };
+    return html(
+      ctx,
+      `⚠️ Точно вычеркнуть <code>@${username}</code>?\n\nПричина: ${escape(reason)}`,
+      new InlineKeyboard().text("Отмена", "confirm:no").text("➖ Вычеркнуть", "confirm:yes").danger(),
+    );
+  }
+
+  const listKeyboard = (p: Page) => pager("list", p).text("➕ Записать", "add").text("➖ Вычеркнуть", "remove");
+  const historyKeyboard = (p: Page) => pager("history", p).text("📓 Тетрадочка", "list");
+
+  bot.command("start", (ctx) => {
+    step = undefined;
+    return html(ctx, GREETING, menu());
   });
 
-  bot.command("remove", async (ctx) => {
-    const { username, reason } = parseArgs(ctx.match);
-    if (!username || !reason) return ctx.reply("Формат: /remove @логин причина");
-    const entry = notebook.remove(username, reason);
-    if (!entry) return ctx.reply(`@${username} нет в тетрадочке.`);
-    return ctx.reply(`Удалён:\n\n${formatEntry(entry)}`);
+  bot.command("add", (ctx) => {
+    const { first, username, reason } = parseArgs(ctx.match);
+    if (first && !username) return html(ctx, NOT_A_LOGIN);
+    return startAdd(ctx, username, reason);
   });
 
-  bot.command("list", async (ctx) => {
-    const entries = notebook.list();
-    if (entries.length === 0) return ctx.reply("Тетрадочка пуста.");
-    await replyChunked(ctx, [`В тетрадочке: ${entries.length}`, ...entries.map(formatEntry)]);
+  bot.command("remove", (ctx) => {
+    const { first, username, reason } = parseArgs(ctx.match);
+    if (first && !username) return html(ctx, NOT_A_LOGIN);
+    return startRemove(ctx, username, reason);
   });
 
-  bot.command("show", async (ctx) => {
-    const { username } = parseArgs(ctx.match);
-    if (!username) return ctx.reply("Формат: /show @логин");
-    const entries = notebook.history(username);
-    if (entries.length === 0) return ctx.reply(`@${username} никогда не был в тетрадочке.`);
-    await replyChunked(ctx, entries.map(formatEntry));
+  const openList = (ctx: Context) => {
+    step = undefined;
+    const p = listPage(notebook.list(), 1);
+    return html(ctx, p.text, listKeyboard(p));
+  };
+
+  const openHistory = (ctx: Context) => {
+    step = undefined;
+    const p = historyPage(notebook.removed(), 1);
+    return html(ctx, p.text, historyKeyboard(p));
+  };
+
+  bot.command("list", openList);
+  bot.command("history", openHistory);
+
+  bot.on("message:text", (ctx) => {
+    const text = ctx.message.text.trim();
+    switch (step?.kind) {
+      case "add-login":
+      case "remove-login": {
+        const username = parseUsername(text);
+        if (!username) return html(ctx, NOT_A_LOGIN);
+        return step.kind === "add-login" ? startAdd(ctx, username) : startRemove(ctx, username);
+      }
+      case "add-reason":
+        return startAdd(ctx, step.username, text);
+      case "remove-reason":
+        return startRemove(ctx, step.username, text);
+      default:
+        step = undefined;
+        return html(ctx, GREETING, menu());
+    }
   });
 
-  bot.on("message", (ctx) => ctx.reply(HELP));
+  bot.on("message", (ctx) => html(ctx, GREETING, menu()));
+
+  bot.callbackQuery("add", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await startAdd(ctx);
+  });
+
+  bot.callbackQuery("remove", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await startRemove(ctx);
+  });
+
+  bot.callbackQuery(/^pick:(.+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await startRemove(ctx, ctx.match[1]);
+  });
+
+  bot.callbackQuery(/^confirm:(yes|no)$/, async (ctx) => {
+    const pending = step?.kind === "remove-confirm" ? step : undefined;
+    step = undefined;
+    await ctx.editMessageReplyMarkup();
+    if (!pending) {
+      await ctx.answerCallbackQuery("Это подтверждение устарело");
+      return;
+    }
+    if (ctx.match[1] === "no") {
+      await ctx.answerCallbackQuery("Отменено");
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const entry = notebook.remove(pending.username, pending.reason);
+    if (!entry) return html(ctx, notInNotebook(pending.username));
+    await html(
+      ctx,
+      removedCard(entry),
+      new InlineKeyboard().text("📓 Тетрадочка", "list").text("🕓 История", "history"),
+    );
+  });
+
+  bot.callbackQuery("list", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await openList(ctx);
+  });
+
+  bot.callbackQuery("history", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await openHistory(ctx);
+  });
+
+  // Paging buttons edit the page message in place.
+  bot.callbackQuery(/^(list|history):(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const page = Number(ctx.match[2]);
+    if (ctx.match[1] === "list") {
+      const p = listPage(notebook.list(), page);
+      await ctx.editMessageText(p.text, { parse_mode: "HTML", reply_markup: listKeyboard(p) });
+    } else {
+      const p = historyPage(notebook.removed(), page);
+      await ctx.editMessageText(p.text, { parse_mode: "HTML", reply_markup: historyKeyboard(p) });
+    }
+  });
+
+  bot.callbackQuery("noop", (ctx) => ctx.answerCallbackQuery());
 
   bot.catch((err) => console.error("Update failed", err.error));
 
   return bot;
 }
-
-export const COMMANDS = [
-  { command: "add", description: "Добавить: @логин причина" },
-  { command: "remove", description: "Удалить: @логин причина" },
-  { command: "list", description: "Кто сейчас в тетрадочке" },
-  { command: "show", description: "История: @логин" },
-];

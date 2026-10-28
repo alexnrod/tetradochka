@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Notebook, parseUsername } from "./notebook.ts";
 
-test("add, remove and re-add keep the full history", () => {
+test("add, remove and re-add keep every removal", () => {
   const nb = new Notebook(":memory:");
   nb.add("Ivan_Petrov", "met at a conference", new Date("2026-01-01T10:00:00Z"));
   assert.equal(nb.active("ivan_petrov")?.addReason, "met at a conference");
@@ -13,11 +13,8 @@ test("add, remove and re-add keep the full history", () => {
   assert.deepEqual(nb.list(), []);
 
   nb.add("ivan_petrov", "came back", new Date("2026-03-01T10:00:00Z"));
-  const history = nb.history("ivan_petrov");
-  assert.deepEqual(
-    history.map((e) => [e.addReason, e.removeReason]),
-    [["met at a conference", "moved away"], ["came back", null]],
-  );
+  assert.deepEqual(nb.list().map((e) => e.addReason), ["came back"]);
+  assert.deepEqual(nb.removed().map((e) => e.removeReason), ["moved away"]);
 });
 
 test("a username can be active only once", () => {
