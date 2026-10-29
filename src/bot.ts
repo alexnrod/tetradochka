@@ -1,4 +1,5 @@
 import { Bot, type Context, InlineKeyboard, Keyboard } from "grammy";
+import type { Message } from "grammy/types";
 import {
   NAME_LIMIT,
   REASON_LIMIT,
@@ -12,7 +13,7 @@ import {
   removedCard,
   type Page,
 } from "./format.ts";
-import { type Entry, type Notebook, type Person, parsePhone, parseUsername } from "./notebook.ts";
+import { type Attachment, type Entry, type Notebook, type Person, parsePhone, parseUsername } from "./notebook.ts";
 
 export const DESCRIPTION =
   "Записывай людей — по логину, аккаунту в Telegram или просто по имени, с датой и причиной. Вычёркивай тоже с причиной: история помнит, кого и почему убрали из тетрадочки.";
@@ -46,7 +47,9 @@ const PICK_USER_REQUEST = 1;
 
 const askName = (p: Person) =>
   p.phone ? `Как зовут человека с номером <code>${p.phone}</code>? Напиши имя и фамилию.` : ASK_NAME;
-const askAddReason = (p: Person) => `Почему записываем ${label(p)}? Напиши пару слов.`;
+const askAddReason = (p: Person) =>
+  `Почему записываем ${label(p)}? Напиши пару слов. Можно приложить фото, скриншот или файл — с подписью или перед текстом.`;
+const filesAdded = (p: Person) => `📎 Приложил. Теперь напиши, почему записываем ${label(p)}.`;
 const askRemoveReason = (p: Person) => `За что вычёркиваем ${label(p)}? Причина останется в истории.`;
 const notInNotebook = (p: Person) => `${label(p)} нет в тетрадочке.`;
 
@@ -58,7 +61,8 @@ const fullName = (first?: string, last?: string) =>
 type Step =
   | { kind: "add-who" }
   | { kind: "add-name"; person: Person }
-  | { kind: "add-reason"; person: Person }
+  // group: the media group of the last attachment, so an album gets one reply.
+  | { kind: "add-reason"; person: Person; files: Attachment[]; group?: string }
   | { kind: "remove-who" }
   | { kind: "remove-reason"; entry: Entry }
   | { kind: "remove-confirm"; entry: Entry; reason: string };
@@ -94,6 +98,12 @@ export function describeError(error: unknown): string {
   return cause ? `${error} (${cause})` : String(error);
 }
 
+// The largest size of a photo, or the file of a document.
+function attachmentOf(m: Message): Attachment | undefined {
+  if (m.photo) return { type: "photo", fileId: m.photo.at(-1)!.file_id };
+  if (m.document) return { type: "document", fileId: m.document.file_id };
+}
+
 // Splits "@login some reason" into the login (undefined if invalid) and the reason.
 function parseArgs(match: string): { first: string; username?: string; reason: string } {
   const [first = "", ...rest] = match.trim().split(/\s+/);
@@ -107,6 +117,8 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
   let step: Step | undefined;
   // Once the add dialog moves past "add-who", the next message without buttons removes its reply keyboard.
   let replyKeyboard = false;
+  // An album arrives as one message per file. The caption completes the entry, so files after it attach to that entry.
+  let album: { group: string; entryId: number } | undefined;
 
   const html = (ctx: Context, text: string, keyboard?: InlineKeyboard | Keyboard) => {
     let markup: InlineKeyboard | Keyboard | { remove_keyboard: true } | undefined = keyboard;
@@ -123,7 +135,13 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
     if (ctx.from?.id === ownerId) await next();
   });
 
-  async function startAdd(ctx: Context, person?: Person, reason?: string) {
+  const cardKeyboard = (e: Entry) => {
+    const kb = new InlineKeyboard();
+    if (e.files) kb.text("📎 Вложения", `files:${e.id}`);
+    return kb.text("📓 Тетрадочка", "list");
+  };
+
+  async function startAdd(ctx: Context, person?: Person, reason?: string, files: Attachment[] = [], group?: string) {
     if (!person) {
       step = { kind: "add-who" };
       return html(ctx, ASK_ADD_WHO, whoKeyboard());
@@ -131,27 +149,36 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
     const existing = notebook.activeAs(person);
     if (existing) {
       step = undefined;
-      return html(ctx, activeCard(existing), new InlineKeyboard().text("📓 Тетрадочка", "list"));
+      return html(ctx, activeCard(existing), cardKeyboard(existing));
     }
     if (!person.username && !person.name) {
       step = { kind: "add-name", person };
       return html(ctx, askName(person));
     }
     if (!reason) {
-      step = { kind: "add-reason", person };
+      step = { kind: "add-reason", person, files };
       return html(ctx, askAddReason(person));
     }
     if (reason.length > REASON_LIMIT) {
-      step = { kind: "add-reason", person };
+      step = { kind: "add-reason", person, files, group };
       return html(ctx, TOO_LONG);
     }
     step = undefined;
-    const entry = notebook.add(person, reason);
-    return html(
-      ctx,
-      addedCard(entry),
-      new InlineKeyboard().text("📓 Тетрадочка", "list").text("➕ Ещё одного", "add"),
-    );
+    const entry = notebook.add(person, reason, files);
+    album = group ? { group, entryId: entry.id } : undefined;
+    return html(ctx, addedCard(entry), cardKeyboard(entry).text("➕ Ещё одного", "add"));
+  }
+
+  async function sendFiles(ctx: Context, id: number) {
+    const entry = notebook.find(id);
+    const files = notebook.files(id);
+    if (!entry || files.length === 0) return html(ctx, "Вложений нет.");
+    const caption = `📎 ${label(entry)}`;
+    for (const [i, f] of files.entries()) {
+      const other = { caption: i === 0 ? caption : undefined, parse_mode: "HTML" as const };
+      if (f.type === "photo") await ctx.replyWithPhoto(f.fileId, other);
+      else await ctx.replyWithDocument(f.fileId, other);
+    }
   }
 
   const pickKeyboard = (entries: Entry[]) => {
@@ -200,6 +227,9 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
 
   bot.command("start", (ctx) => {
     step = undefined;
+    // Deep link from the 📎 mark in the list and history.
+    const files = ctx.match.match(/^files_(\d+)$/);
+    if (files) return sendFiles(ctx, Number(files[1]));
     return html(ctx, GREETING, menu());
   });
 
@@ -220,13 +250,13 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
 
   const openList = (ctx: Context) => {
     step = undefined;
-    const p = listPage(notebook.list(), 1);
+    const p = listPage(notebook.list(), 1, ctx.me.username);
     return html(ctx, p.text, listKeyboard(p));
   };
 
   const openHistory = (ctx: Context) => {
     step = undefined;
-    const p = historyPage(notebook.removed(), 1);
+    const p = historyPage(notebook.removed(), 1, ctx.me.username);
     return html(ctx, p.text, historyKeyboard(p));
   };
 
@@ -251,7 +281,7 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
         if (text.length > NAME_LIMIT) return html(ctx, NAME_TOO_LONG);
         return startAdd(ctx, { ...step.person, name: text });
       case "add-reason":
-        return startAdd(ctx, step.person, text);
+        return startAdd(ctx, step.person, text, step.files);
       case "remove-who": {
         const found = notebook.search(text);
         if (found.length === 0) return html(ctx, ASK_REMOVE_WHO);
@@ -287,6 +317,22 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
       phone: parsePhone(c.phone_number) ?? c.phone_number,
       name: fullName(c.first_name, c.last_name),
     });
+  });
+
+  // A photo or file while the bot asks the add reason. Its caption, if any, is the reason.
+  bot.on(["message:photo", "message:document"], (ctx) => {
+    const file = attachmentOf(ctx.message)!;
+    const group = ctx.message.media_group_id;
+    if (step?.kind !== "add-reason") {
+      if (group && album?.group === group) return notebook.attach(album.entryId, [file]);
+      return html(ctx, GREETING, menu());
+    }
+    const files = [...step.files, file];
+    const caption = ctx.message.caption?.trim();
+    if (caption) return startAdd(ctx, step.person, caption, files, group);
+    const answered = group !== undefined && step.group === group;
+    step = { ...step, files, group };
+    if (!answered) return html(ctx, filesAdded(step.person));
   });
 
   bot.on("message", (ctx) => html(ctx, GREETING, menu()));
@@ -345,12 +391,17 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
     await ctx.answerCallbackQuery();
     const page = Number(ctx.match[2]);
     if (ctx.match[1] === "list") {
-      const p = listPage(notebook.list(), page);
+      const p = listPage(notebook.list(), page, ctx.me.username);
       await ctx.editMessageText(p.text, { parse_mode: "HTML", reply_markup: listKeyboard(p) });
     } else {
-      const p = historyPage(notebook.removed(), page);
+      const p = historyPage(notebook.removed(), page, ctx.me.username);
       await ctx.editMessageText(p.text, { parse_mode: "HTML", reply_markup: historyKeyboard(p) });
     }
+  });
+
+  bot.callbackQuery(/^files:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await sendFiles(ctx, Number(ctx.match[1]));
   });
 
   bot.callbackQuery("noop", (ctx) => ctx.answerCallbackQuery());

@@ -11,12 +11,17 @@ export type Person = {
   phone?: string;
 };
 
+// A photo or a file attached to the add reason. Telegram keeps the file; the notebook keeps its file_id.
+export type Attachment = { type: "photo" | "document"; fileId: string };
+
 export type Entry = Person & {
   id: number;
   addedAt: string;
   addReason: string;
   removedAt: string | null;
   removeReason: string | null;
+  // Number of attachments.
+  files: number;
 };
 
 type Row = {
@@ -30,6 +35,7 @@ type Row = {
   add_reason: string;
   removed_at: string | null;
   remove_reason: string | null;
+  files: number;
 };
 
 const toEntry = (r: Row): Entry => ({
@@ -43,6 +49,7 @@ const toEntry = (r: Row): Entry => ({
   addReason: r.add_reason,
   removedAt: r.removed_at,
   removeReason: r.remove_reason,
+  files: r.files,
 });
 
 const SCHEMA = `
@@ -63,6 +70,18 @@ const SCHEMA = `
   CREATE UNIQUE INDEX entries_active_phone ON entries(phone) WHERE removed_at IS NULL;
 `;
 
+const ATTACHMENTS = `
+  CREATE TABLE attachments (
+    id INTEGER PRIMARY KEY,
+    entry_id INTEGER NOT NULL REFERENCES entries(id),
+    type TEXT NOT NULL CHECK (type IN ('photo', 'document')),
+    file_id TEXT NOT NULL
+  );
+  CREATE INDEX attachments_entry ON attachments(entry_id);
+`;
+
+const SELECT = "SELECT *, (SELECT count(*) FROM attachments WHERE entry_id = entries.id) AS files FROM entries";
+
 // A person can be added again after removal, so each stay in the notebook is its own row.
 // At most one active row (removed_at IS NULL) exists per login, account id and phone.
 export class Notebook {
@@ -75,9 +94,14 @@ export class Notebook {
   }
 
   // user_version 0 is either an empty file or the first schema, where every entry had a login.
+  // Version 2 adds attachments.
   #migrate(): void {
     const { user_version } = this.#db.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (user_version >= 1) return;
+    if (user_version < 1) this.#migrateToV1();
+    if (user_version < 2) this.#db.exec(`BEGIN; ${ATTACHMENTS} PRAGMA user_version = 2; COMMIT`);
+  }
+
+  #migrateToV1(): void {
     const exists = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries'").get();
     this.#db.exec("BEGIN");
     if (exists) {
@@ -96,9 +120,13 @@ export class Notebook {
   }
 
   get(id: number): Entry | undefined {
-    const row = this.#db.prepare("SELECT * FROM entries WHERE id = ? AND removed_at IS NULL").get(id) as
-      | Row
-      | undefined;
+    const entry = this.find(id);
+    return entry?.removedAt === null ? entry : undefined;
+  }
+
+  // An entry by id, active or removed.
+  find(id: number): Entry | undefined {
+    const row = this.#db.prepare(`${SELECT} WHERE id = ?`).get(id) as Row | undefined;
     return row && toEntry(row);
   }
 
@@ -110,7 +138,7 @@ export class Notebook {
   activeAs(p: Person): Entry | undefined {
     const row = this.#db
       .prepare(
-        "SELECT * FROM entries WHERE removed_at IS NULL AND (username = ? OR user_id = ? OR phone = ?) LIMIT 1",
+        `${SELECT} WHERE removed_at IS NULL AND (username = ? OR user_id = ? OR phone = ?) LIMIT 1`,
       )
       .get(p.username ?? null, p.userId ?? null, p.phone ?? null) as Row | undefined;
     return row && toEntry(row);
@@ -130,13 +158,15 @@ export class Notebook {
     );
   }
 
-  add(p: Person, reason: string, now = new Date()): Entry {
-    const row = this.#db
-      .prepare(
-        `INSERT INTO entries (kind, username, user_id, name, phone, added_at, add_reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      )
-      .get(
+  add(p: Person, reason: string, files: Attachment[] = [], now = new Date()): Entry {
+    this.#db.exec("BEGIN");
+    try {
+      const { id } = this.#db
+        .prepare(
+          `INSERT INTO entries (kind, username, user_id, name, phone, added_at, add_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+        )
+        .get(
         p.kind,
         p.username ?? null,
         p.userId ?? null,
@@ -144,22 +174,38 @@ export class Notebook {
         p.phone ?? null,
         now.toISOString(),
         reason,
-      ) as Row;
-    return toEntry(row);
+      ) as { id: number };
+      this.attach(id, files);
+      this.#db.exec("COMMIT");
+      return this.find(id)!;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  attach(entryId: number, files: Attachment[]): void {
+    const insert = this.#db.prepare("INSERT INTO attachments (entry_id, type, file_id) VALUES (?, ?, ?)");
+    for (const f of files) insert.run(entryId, f.type, f.fileId);
+  }
+
+  files(entryId: number): Attachment[] {
+    const rows = this.#db
+      .prepare("SELECT type, file_id FROM attachments WHERE entry_id = ? ORDER BY id")
+      .all(entryId) as { type: Attachment["type"]; file_id: string }[];
+    return rows.map((r) => ({ type: r.type, fileId: r.file_id }));
   }
 
   remove(id: number, reason: string, now = new Date()): Entry | undefined {
-    const row = this.#db
-      .prepare(
-        "UPDATE entries SET removed_at = ?, remove_reason = ? WHERE id = ? AND removed_at IS NULL RETURNING *",
-      )
-      .get(now.toISOString(), reason, id) as Row | undefined;
-    return row && toEntry(row);
+    const { changes } = this.#db
+      .prepare("UPDATE entries SET removed_at = ?, remove_reason = ? WHERE id = ? AND removed_at IS NULL")
+      .run(now.toISOString(), reason, id);
+    return changes ? this.find(id) : undefined;
   }
 
   list(): Entry[] {
     const rows = this.#db
-      .prepare("SELECT * FROM entries WHERE removed_at IS NULL ORDER BY added_at")
+      .prepare(`${SELECT} WHERE removed_at IS NULL ORDER BY added_at`)
       .all() as Row[];
     return rows.map(toEntry);
   }
@@ -167,7 +213,7 @@ export class Notebook {
   // Removed entries, most recently removed first.
   removed(): Entry[] {
     const rows = this.#db
-      .prepare("SELECT * FROM entries WHERE removed_at IS NOT NULL ORDER BY removed_at DESC")
+      .prepare(`${SELECT} WHERE removed_at IS NOT NULL ORDER BY removed_at DESC`)
       .all() as Row[];
     return rows.map(toEntry);
   }

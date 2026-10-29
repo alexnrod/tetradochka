@@ -113,21 +113,27 @@ export const NAME_LIMIT = 60;
 const LIST_PAGE_SIZE = 10;
 const HISTORY_PAGE_SIZE = 5;
 
-export function listPage(entries: Entry[], page: number): Page {
+// "📎 2" after an entry with attachments. The link sends "/start files_<id>" to the bot, which replies with the files.
+function filesLink(e: Entry, bot: string): string {
+  return e.files ? ` · <a href="https://t.me/${bot}?start=files_${e.id}">📎 ${e.files}</a>` : "";
+}
+
+export function listPage(entries: Entry[], page: number, bot: string): Page {
   if (entries.length === 0) return { text: "📓 <b>Тетрадочка</b>\n\nПока пусто.", page: 1, pages: 1 };
   const p = paginate(entries, page, LIST_PAGE_SIZE);
   const rows = p.slice.map(
-    (e, i) => `${p.start + i + 1}. ${label(e)} · ${shortDate(e.addedAt)}\n${escape(e.addReason)}`,
+    (e, i) =>
+      `${p.start + i + 1}. ${label(e)} · ${shortDate(e.addedAt)}${filesLink(e, bot)}\n${escape(e.addReason)}`,
   );
   return { text: [`📓 <b>Тетрадочка</b> · ${people(entries.length)}`, ...rows].join("\n\n"), page: p.page, pages: p.pages };
 }
 
-export function historyPage(entries: Entry[], page: number): Page {
+export function historyPage(entries: Entry[], page: number, bot: string): Page {
   if (entries.length === 0) return { text: "🕓 <b>История</b>\n\nНикого не вычёркивали.", page: 1, pages: 1 };
   const p = paginate(entries, page, HISTORY_PAGE_SIZE);
   const rows = p.slice.map((e, i) =>
     [
-      `${p.start + i + 1}. <s>${escape(plainLabel(e))}</s>`,
+      `${p.start + i + 1}. <s>${escape(plainLabel(e))}</s>${filesLink(e, bot)}`,
       `Записали ${shortDate(e.addedAt)}: ${escape(e.addReason)}`,
       `Вычеркнули ${shortDate(e.removedAt!)}: ${escape(e.removeReason!)}`,
     ].join("\n"),

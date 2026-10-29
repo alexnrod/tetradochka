@@ -156,7 +156,7 @@ test("a user picked in Telegram is added with id, login and name", async () => {
   assert.deepEqual(
     { ...t.notebook.activeAs({ kind: "telegram", userId: 555 }), addedAt: undefined },
     { id: 1, kind: "telegram", userId: 555, username: undefined, name: "Иван Петров", phone: undefined,
-      addedAt: undefined, addReason: "Сосед", removedAt: null, removeReason: null },
+      addedAt: undefined, addReason: "Сосед", removedAt: null, removeReason: null, files: 0 },
   );
   await t.message({ users_shared: { request_id: 1, users: [{ user_id: 555, first_name: "Иван" }] } });
   assert.match(t.lastReply().text, /уже в тетрадочке/);
@@ -196,6 +196,44 @@ test("a person without Telegram is added by name and removed by name", async () 
   await t.send("Продал дачу");
   await t.press("confirm:yes");
   assert.match(t.lastReply().text, /<s>✍️ Иван Петров<\/s> · вычеркнуто/);
+});
+
+const photo = (fileId: string) => [{ file_id: `${fileId}_small`, file_unique_id: "s", width: 90, height: 90 },
+  { file_id: fileId, file_unique_id: "l", width: 1280, height: 1280 }];
+
+test("files sent before the reason are attached", async () => {
+  const t = setup();
+  await t.send("/add @masha_k");
+  assert.match(t.lastReply().text, /Можно приложить фото, скриншот или файл/);
+  await t.message({ photo: photo("p1") });
+  assert.match(t.lastReply().text, /Приложил\. Теперь напиши, почему записываем <code>@masha_k<\/code>/);
+  await t.message({ document: { file_id: "d1", file_unique_id: "d", file_name: "chat.pdf" } });
+  await t.send("Переписка");
+  assert.match(t.lastReply().text, /Записано в тетрадочку/);
+  assert.deepEqual(t.buttons(t.lastReply()), ["files:1", "list", "add"]);
+  assert.deepEqual(t.notebook.files(1), [{ type: "photo", fileId: "p1" }, { type: "document", fileId: "d1" }]);
+
+  await t.press("files:1");
+  assert.deepEqual(
+    t.calls.slice(-2).map((c) => [c.method, c.payload.photo ?? c.payload.document, c.payload.caption]),
+    [["sendPhoto", "p1", "📎 <code>@masha_k</code>"], ["sendDocument", "d1", undefined]],
+  );
+  await t.send("/list");
+  assert.match(t.lastReply().text, /<a href="https:\/\/t\.me\/test_bot\?start=files_1">📎 2<\/a>/);
+  await t.send("/start files_1");
+  assert.equal(t.calls.filter((c) => c.method === "sendPhoto").length, 2);
+});
+
+test("an album caption is the reason and the whole album is attached", async () => {
+  const t = setup();
+  await t.send("/add @olga_s");
+  await t.message({ photo: photo("a1"), media_group_id: "g" });
+  await t.message({ photo: photo("a2"), media_group_id: "g", caption: "Скриншоты" });
+  await t.message({ photo: photo("a3"), media_group_id: "g" });
+  const replies = t.replies().map((r) => r.text);
+  assert.equal(replies.filter((r) => /Приложил/.test(r)).length, 1);
+  assert.match(replies.at(-1), /Почему: Скриншоты/);
+  assert.deepEqual(t.notebook.files(1).map((f) => f.fileId), ["a1", "a2", "a3"]);
 });
 
 test("strangers get no reply", async () => {

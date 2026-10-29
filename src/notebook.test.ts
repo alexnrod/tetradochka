@@ -10,7 +10,7 @@ const login = (username: string) => ({ kind: "telegram" as const, username });
 
 test("add, remove and re-add keep every removal", () => {
   const nb = new Notebook(":memory:");
-  nb.add(login("Ivan_Petrov"), "met at a conference", new Date("2026-01-01T10:00:00Z"));
+  nb.add(login("Ivan_Petrov"), "met at a conference", [], new Date("2026-01-01T10:00:00Z"));
   const entry = nb.active("ivan_petrov")!;
   assert.equal(entry.addReason, "met at a conference");
 
@@ -19,7 +19,7 @@ test("add, remove and re-add keep every removal", () => {
   assert.equal(nb.active("ivan_petrov"), undefined);
   assert.deepEqual(nb.list(), []);
 
-  nb.add(login("ivan_petrov"), "came back", new Date("2026-03-01T10:00:00Z"));
+  nb.add(login("ivan_petrov"), "came back", [], new Date("2026-03-01T10:00:00Z"));
   assert.deepEqual(nb.list().map((e) => e.addReason), ["came back"]);
   assert.deepEqual(nb.removed().map((e) => e.removeReason), ["moved away"]);
 });
@@ -50,6 +50,16 @@ test("search finds by login, phone and name", () => {
   assert.deepEqual(nb.search("8 916 123-45-67").map((e) => e.addReason), ["b"]);
   assert.deepEqual(nb.search("маша").map((e) => e.addReason), ["b"]);
   assert.deepEqual(nb.search("никто"), []);
+});
+
+test("attachments stay with the entry after removal", () => {
+  const nb = new Notebook(":memory:");
+  const entry = nb.add(login("durov"), "a", [{ type: "photo", fileId: "p1" }, { type: "document", fileId: "d1" }]);
+  assert.equal(entry.files, 2);
+  nb.attach(entry.id, [{ type: "photo", fileId: "p2" }]);
+  assert.equal(nb.remove(entry.id, "b")?.files, 3);
+  assert.equal(nb.removed()[0].files, 3);
+  assert.deepEqual(nb.files(entry.id).map((f) => f.fileId), ["p1", "d1", "p2"]);
 });
 
 test("remove of an absent entry returns undefined", () => {

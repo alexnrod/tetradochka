@@ -20,6 +20,8 @@ A person is one of three kinds, each with its own look in the list:
 
 A login, Telegram account or phone can be in the notebook only once. Names may repeat. `/remove` also accepts a login, phone or name typed as a message.
 
+When the bot asks why a person is added, photos, screenshots and files can be sent along with the reason: as a caption, or before the text. An album with a caption on one of its files attaches the whole album. The bot stores each file's Telegram `file_id`, the files themselves stay on Telegram. The card shows a «📎 Вложения» button, and the list and history mark such entries with a `📎 N` link that sends the files.
+
 `/add @login reason` and `/remove @login reason` skip the questions. A removed person stays in the history and can be added again. Reasons are capped at 300 characters so a page fits into one Telegram message.
 
 The look follows `design.html`. The avatar is `assets/avatar.jpg`, a 640×640 JPEG of `assets/icon.png` on white, set once through the Bot API:
