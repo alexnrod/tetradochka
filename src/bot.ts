@@ -1,47 +1,75 @@
-import { Bot, type Context, InlineKeyboard } from "grammy";
+import { Bot, type Context, InlineKeyboard, Keyboard } from "grammy";
 import {
+  NAME_LIMIT,
   REASON_LIMIT,
   activeCard,
   addedCard,
   escape,
   historyPage,
+  label,
   listPage,
+  plainLabel,
   removedCard,
   type Page,
 } from "./format.ts";
-import { type Notebook, parseUsername } from "./notebook.ts";
+import { type Entry, type Notebook, type Person, parsePhone, parseUsername } from "./notebook.ts";
 
 export const DESCRIPTION =
-  "Записывай людей по логину в Telegram — с датой и причиной. Вычёркивай тоже с причиной: история помнит, кого и почему убрали из тетрадочки.";
-export const SHORT_DESCRIPTION = "Люди по логину в Telegram — с датой и причиной.";
+  "Записывай людей — по логину, аккаунту в Telegram или просто по имени, с датой и причиной. Вычёркивай тоже с причиной: история помнит, кого и почему убрали из тетрадочки.";
+export const SHORT_DESCRIPTION = "Люди в тетрадочке — с датой и причиной.";
 
 export const COMMANDS = [
   { command: "start", description: "Открыть тетрадочку и главное меню" },
-  { command: "add", description: "Записать человека: логин и почему" },
+  { command: "add", description: "Записать человека и почему" },
   { command: "remove", description: "Вычеркнуть человека и объяснить причину" },
   { command: "list", description: "Кто сейчас в тетрадочке" },
   { command: "history", description: "Все вычеркнутые — когда и почему" },
 ];
 
 const GREETING = "Привет! Это твоя тетрадочка. Записывай сюда людей и вычёркивай их — всегда с датой и причиной.";
-const ASK_ADD_LOGIN = "Кого записываем? Пришли логин в Telegram, например @username";
+const PICK_USER = "👤 Выбрать в Telegram";
+const NO_TELEGRAM = "✍️ Без Telegram";
+const ASK_ADD_WHO = [
+  "Кого записываем? Пришли логин (@username) или телефон, выбери человека кнопкой «👤 Выбрать в Telegram» или пришли его контакт.",
+  "",
+  "Если у человека нет Telegram, нажми «✍️ Без Telegram».",
+].join("\n");
+const NOT_A_PERSON = "Не похоже на логин или телефон. Пришли @username, номер телефона или выбери вариант кнопкой.";
 const NOT_A_LOGIN = "Не похоже на логин. Пришли его в виде @username";
+const ASK_NAME = "Как зовут? Напиши имя и фамилию.";
+const ASK_REMOVE_WHO = "Не нашёл такого в тетрадочке. Пришли логин, телефон или имя и фамилию, как записано.";
 const TOO_LONG = `Слишком длинно. Уложись в ${REASON_LIMIT} символов.`;
+const NAME_TOO_LONG = `Слишком длинно. Уложись в ${NAME_LIMIT} символов.`;
 const PICK_LIMIT = 20;
+// Identifies the "pick a user" button in the users_shared update.
+const PICK_USER_REQUEST = 1;
 
-const askAddReason = (u: string) => `Почему записываем <code>@${u}</code>? Напиши пару слов.`;
-const askRemoveReason = (u: string) =>
-  `За что вычёркиваем <code>@${u}</code>? Причина останется в истории.`;
-const notInNotebook = (u: string) => `<code>@${u}</code> нет в тетрадочке.`;
+const askName = (p: Person) =>
+  p.phone ? `Как зовут человека с номером <code>${p.phone}</code>? Напиши имя и фамилию.` : ASK_NAME;
+const askAddReason = (p: Person) => `Почему записываем ${label(p)}? Напиши пару слов.`;
+const askRemoveReason = (p: Person) => `За что вычёркиваем ${label(p)}? Причина останется в истории.`;
+const notInNotebook = (p: Person) => `${label(p)} нет в тетрадочке.`;
+
+const fullName = (first?: string, last?: string) =>
+  [first, last].filter(Boolean).join(" ").slice(0, NAME_LIMIT) || undefined;
 
 // The step the owner is in while the bot waits for their next message.
 // Kept in memory: a restart only drops an unfinished dialog.
 type Step =
-  | { kind: "add-login" }
-  | { kind: "add-reason"; username: string }
-  | { kind: "remove-login" }
-  | { kind: "remove-reason"; username: string }
-  | { kind: "remove-confirm"; username: string; reason: string };
+  | { kind: "add-who" }
+  | { kind: "add-name"; person: Person }
+  | { kind: "add-reason"; person: Person }
+  | { kind: "remove-who" }
+  | { kind: "remove-reason"; entry: Entry }
+  | { kind: "remove-confirm"; entry: Entry; reason: string };
+
+// Telegram sends the picked user or contact as a message, so these buttons live in a reply keyboard under the input field.
+const whoKeyboard = () =>
+  new Keyboard()
+    .requestUsers(PICK_USER, PICK_USER_REQUEST, { user_is_bot: false, request_name: true, request_username: true })
+    .text(NO_TELEGRAM)
+    .resized()
+    .oneTime();
 
 const menu = () =>
   new InlineKeyboard()
@@ -77,35 +105,48 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
   // Long polling waits up to 30 seconds, so 40 seconds still covers a full poll.
   const bot = new Bot(token, { botInfo, client: { timeoutSeconds: 40 } });
   let step: Step | undefined;
+  // Once the add dialog moves past "add-who", the next message without buttons removes its reply keyboard.
+  let replyKeyboard = false;
 
-  const html = (ctx: Context, text: string, keyboard?: InlineKeyboard) =>
-    ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
+  const html = (ctx: Context, text: string, keyboard?: InlineKeyboard | Keyboard) => {
+    let markup: InlineKeyboard | Keyboard | { remove_keyboard: true } | undefined = keyboard;
+    if (keyboard instanceof Keyboard) replyKeyboard = true;
+    else if (!keyboard && replyKeyboard && step?.kind !== "add-who") {
+      markup = { remove_keyboard: true };
+      replyKeyboard = false;
+    }
+    return ctx.reply(text, { parse_mode: "HTML", reply_markup: markup });
+  };
 
   // The notebook is private: updates from anyone but the owner are dropped without a reply.
   bot.use(async (ctx, next) => {
     if (ctx.from?.id === ownerId) await next();
   });
 
-  async function startAdd(ctx: Context, username?: string, reason?: string) {
-    if (!username) {
-      step = { kind: "add-login" };
-      return html(ctx, ASK_ADD_LOGIN);
+  async function startAdd(ctx: Context, person?: Person, reason?: string) {
+    if (!person) {
+      step = { kind: "add-who" };
+      return html(ctx, ASK_ADD_WHO, whoKeyboard());
     }
-    const existing = notebook.active(username);
+    const existing = notebook.activeAs(person);
     if (existing) {
       step = undefined;
       return html(ctx, activeCard(existing), new InlineKeyboard().text("📓 Тетрадочка", "list"));
     }
+    if (!person.username && !person.name) {
+      step = { kind: "add-name", person };
+      return html(ctx, askName(person));
+    }
     if (!reason) {
-      step = { kind: "add-reason", username };
-      return html(ctx, askAddReason(username));
+      step = { kind: "add-reason", person };
+      return html(ctx, askAddReason(person));
     }
     if (reason.length > REASON_LIMIT) {
-      step = { kind: "add-reason", username };
+      step = { kind: "add-reason", person };
       return html(ctx, TOO_LONG);
     }
     step = undefined;
-    const entry = notebook.add(username, reason);
+    const entry = notebook.add(person, reason);
     return html(
       ctx,
       addedCard(entry),
@@ -113,38 +154,43 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
     );
   }
 
-  async function startRemove(ctx: Context, username?: string, reason?: string) {
-    if (!username) {
+  const pickKeyboard = (entries: Entry[]) => {
+    const kb = new InlineKeyboard();
+    entries.slice(0, PICK_LIMIT).forEach((e, i) => {
+      kb.text(plainLabel(e), `pick:${e.id}`);
+      if (i % 2 === 1) kb.row();
+    });
+    return kb;
+  };
+
+  async function startRemove(ctx: Context, entry?: Entry, reason?: string) {
+    if (!entry) {
       const active = notebook.list();
       if (active.length === 0) {
         step = undefined;
         return html(ctx, "Тетрадочка пуста, вычёркивать некого.", new InlineKeyboard().text("➕ Записать", "add"));
       }
-      step = { kind: "remove-login" };
-      const kb = new InlineKeyboard();
-      active.slice(0, PICK_LIMIT).forEach((e, i) => {
-        kb.text(`@${e.username}`, `pick:${e.username}`);
-        if (i % 2 === 1) kb.row();
-      });
-      const hint = active.length > PICK_LIMIT ? "\n\nВ кнопках не все — можно прислать логин сообщением." : "";
-      return html(ctx, `Кого вычёркиваем?${hint}`, kb);
+      step = { kind: "remove-who" };
+      const hint =
+        active.length > PICK_LIMIT ? "\n\nВ кнопках не все — можно прислать логин, телефон или имя сообщением." : "";
+      return html(ctx, `Кого вычёркиваем?${hint}`, pickKeyboard(active));
     }
-    if (!notebook.active(username)) {
+    if (!notebook.get(entry.id)) {
       step = undefined;
-      return html(ctx, notInNotebook(username));
+      return html(ctx, notInNotebook(entry));
     }
     if (!reason) {
-      step = { kind: "remove-reason", username };
-      return html(ctx, askRemoveReason(username));
+      step = { kind: "remove-reason", entry };
+      return html(ctx, askRemoveReason(entry));
     }
     if (reason.length > REASON_LIMIT) {
-      step = { kind: "remove-reason", username };
+      step = { kind: "remove-reason", entry };
       return html(ctx, TOO_LONG);
     }
-    step = { kind: "remove-confirm", username, reason };
+    step = { kind: "remove-confirm", entry, reason };
     return html(
       ctx,
-      `⚠️ Точно вычеркнуть <code>@${username}</code>?\n\nПричина: ${escape(reason)}`,
+      `⚠️ Точно вычеркнуть ${label(entry)}?\n\nПричина: ${escape(reason)}`,
       new InlineKeyboard().text("Отмена", "confirm:no").text("➖ Вычеркнуть", "confirm:yes").danger(),
     );
   }
@@ -160,13 +206,16 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
   bot.command("add", (ctx) => {
     const { first, username, reason } = parseArgs(ctx.match);
     if (first && !username) return html(ctx, NOT_A_LOGIN);
-    return startAdd(ctx, username, reason);
+    return startAdd(ctx, username ? { kind: "telegram", username } : undefined, reason);
   });
 
   bot.command("remove", (ctx) => {
     const { first, username, reason } = parseArgs(ctx.match);
     if (first && !username) return html(ctx, NOT_A_LOGIN);
-    return startRemove(ctx, username, reason);
+    if (!username) return startRemove(ctx);
+    const entry = notebook.active(username);
+    if (!entry) return html(ctx, notInNotebook({ kind: "telegram", username }));
+    return startRemove(ctx, entry, reason);
   });
 
   const openList = (ctx: Context) => {
@@ -187,20 +236,57 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
   bot.on("message:text", (ctx) => {
     const text = ctx.message.text.trim();
     switch (step?.kind) {
-      case "add-login":
-      case "remove-login": {
+      case "add-who": {
+        if (text === NO_TELEGRAM) {
+          step = { kind: "add-name", person: { kind: "offline" } };
+          return html(ctx, ASK_NAME);
+        }
         const username = parseUsername(text);
-        if (!username) return html(ctx, NOT_A_LOGIN);
-        return step.kind === "add-login" ? startAdd(ctx, username) : startRemove(ctx, username);
+        if (username) return startAdd(ctx, { kind: "telegram", username });
+        const phone = parsePhone(text);
+        if (phone) return startAdd(ctx, { kind: "telegram", phone });
+        return html(ctx, NOT_A_PERSON);
       }
+      case "add-name":
+        if (text.length > NAME_LIMIT) return html(ctx, NAME_TOO_LONG);
+        return startAdd(ctx, { ...step.person, name: text });
       case "add-reason":
-        return startAdd(ctx, step.username, text);
+        return startAdd(ctx, step.person, text);
+      case "remove-who": {
+        const found = notebook.search(text);
+        if (found.length === 0) return html(ctx, ASK_REMOVE_WHO);
+        if (found.length === 1) return startRemove(ctx, found[0]);
+        return html(ctx, "Таких несколько. Кого вычёркиваем?", pickKeyboard(found));
+      }
       case "remove-reason":
-        return startRemove(ctx, step.username, text);
+        return startRemove(ctx, step.entry, text);
       default:
         step = undefined;
         return html(ctx, GREETING, menu());
     }
+  });
+
+  // A picked user or a shared contact starts the add dialog from any step.
+  bot.on("message:users_shared", (ctx) => {
+    const user = ctx.message.users_shared.users[0];
+    if (!user) return startAdd(ctx);
+    return startAdd(ctx, {
+      kind: "telegram",
+      userId: user.user_id,
+      username: user.username,
+      name: fullName(user.first_name, user.last_name),
+    });
+  });
+
+  // A contact carries user_id only when the person has a Telegram account.
+  bot.on("message:contact", (ctx) => {
+    const c = ctx.message.contact;
+    return startAdd(ctx, {
+      kind: c.user_id ? "telegram" : "offline",
+      userId: c.user_id,
+      phone: parsePhone(c.phone_number) ?? c.phone_number,
+      name: fullName(c.first_name, c.last_name),
+    });
   });
 
   bot.on("message", (ctx) => html(ctx, GREETING, menu()));
@@ -215,9 +301,11 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
     await startRemove(ctx);
   });
 
-  bot.callbackQuery(/^pick:(.+)$/, async (ctx) => {
+  bot.callbackQuery(/^pick:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
-    await startRemove(ctx, ctx.match[1]);
+    const entry = notebook.get(Number(ctx.match[1]));
+    if (!entry) return html(ctx, "Этого человека уже нет в тетрадочке.");
+    await startRemove(ctx, entry);
   });
 
   bot.callbackQuery(/^confirm:(yes|no)$/, async (ctx) => {
@@ -233,8 +321,8 @@ export function createBot(token: string, ownerId: number, notebook: Notebook, bo
       return;
     }
     await ctx.answerCallbackQuery();
-    const entry = notebook.remove(pending.username, pending.reason);
-    if (!entry) return html(ctx, notInNotebook(pending.username));
+    const entry = notebook.remove(pending.entry.id, pending.reason);
+    if (!entry) return html(ctx, notInNotebook(pending.entry));
     await html(
       ctx,
       removedCard(entry),

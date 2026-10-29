@@ -22,6 +22,8 @@ const botInfo = {
 
 type Call = { method: string; payload: any };
 
+const login = (username: string) => ({ kind: "telegram" as const, username });
+
 function setup() {
   const notebook = new Notebook(":memory:");
   const bot = createBot("token", OWNER, notebook, botInfo as any);
@@ -34,20 +36,15 @@ function setup() {
   const chat = { id: OWNER, type: "private" as const, first_name: "Owner" };
   const from = { id: OWNER, is_bot: false, first_name: "Owner" };
 
+  const message = (fields: object, fromId = OWNER) =>
+    bot.handleUpdate({
+      update_id: ++id,
+      message: { message_id: id, date: 0, chat, from: { ...from, id: fromId }, ...fields },
+    } as Update);
   const send = (text: string, fromId = OWNER) => {
     const command = text.match(/^\/\w+/);
-    const update: Update = {
-      update_id: ++id,
-      message: {
-        message_id: id,
-        date: 0,
-        chat,
-        from: { ...from, id: fromId },
-        text,
-        entities: command ? [{ type: "bot_command", offset: 0, length: command[0].length }] : undefined,
-      },
-    };
-    return bot.handleUpdate(update);
+    const entities = command ? [{ type: "bot_command", offset: 0, length: command[0].length }] : undefined;
+    return message({ text, entities }, fromId);
   };
   const press = (data: string) =>
     bot.handleUpdate({
@@ -65,17 +62,22 @@ function setup() {
   const buttons = (payload: any): string[] =>
     payload.reply_markup.inline_keyboard.flat().map((b: { callback_data: string }) => b.callback_data);
 
-  return { notebook, send, press, calls, replies, lastReply, buttons };
+  return { notebook, message, send, press, calls, replies, lastReply, buttons };
 }
 
 test("add dialog asks for login and reason, then shows the card", async () => {
   const t = setup();
   await t.press("add");
   assert.match(t.lastReply().text, /Кого записываем/);
+  assert.deepEqual(
+    t.lastReply().reply_markup.keyboard.flat().map((b: { text: string }) => b.text),
+    ["👤 Выбрать в Telegram", "✍️ Без Telegram"],
+  );
   await t.send("Иван Петров");
-  assert.match(t.lastReply().text, /Не похоже на логин/);
+  assert.match(t.lastReply().text, /Не похоже на логин или телефон/);
   await t.send("@ivan_petrov");
   assert.match(t.lastReply().text, /Почему записываем <code>@ivan_petrov<\/code>/);
+  assert.deepEqual(t.lastReply().reply_markup, { remove_keyboard: true });
   await t.send("Обещал <вернуть> книгу");
   assert.match(t.lastReply().text, /Записано в тетрадочку/);
   assert.match(t.lastReply().text, /Обещал &lt;вернуть&gt; книгу/);
@@ -93,11 +95,11 @@ test("one-line /add and an already active login", async () => {
 
 test("remove dialog picks a login, asks the reason and confirms", async () => {
   const t = setup();
-  t.notebook.add("masha_k", "Позвала на день рождения");
-  t.notebook.add("olga_s", "Посоветовала врача");
+  t.notebook.add(login("masha_k"), "Позвала на день рождения");
+  t.notebook.add(login("olga_s"), "Посоветовала врача");
   await t.send("/remove");
-  assert.deepEqual(t.buttons(t.lastReply()), ["pick:masha_k", "pick:olga_s"]);
-  await t.press("pick:masha_k");
+  assert.deepEqual(t.buttons(t.lastReply()), ["pick:1", "pick:2"]);
+  await t.press("pick:1");
   assert.match(t.lastReply().text, /За что вычёркиваем/);
   await t.send("Уже поздравил, вопрос закрыт");
   assert.match(t.lastReply().text, /Точно вычеркнуть/);
@@ -112,7 +114,7 @@ test("remove dialog picks a login, asks the reason and confirms", async () => {
 
 test("cancel keeps the person and a stale confirmation does nothing", async () => {
   const t = setup();
-  t.notebook.add("olga_s", "Посоветовала врача");
+  t.notebook.add(login("olga_s"), "Посоветовала врача");
   await t.send("/remove @olga_s передумал");
   await t.press("confirm:no");
   assert.ok(t.notebook.active("olga_s"));
@@ -124,7 +126,7 @@ test("cancel keeps the person and a stale confirmation does nothing", async () =
 
 test("list pages through entries", async () => {
   const t = setup();
-  for (let i = 0; i < 12; i++) t.notebook.add(`user_${String(i).padStart(2, "0")}`, `reason ${i}`);
+  for (let i = 0; i < 12; i++) t.notebook.add(login(`user_${String(i).padStart(2, "0")}`), `reason ${i}`);
   await t.send("/list");
   assert.match(t.lastReply().text, /12 человек/);
   assert.deepEqual(t.buttons(t.lastReply()), ["noop", "list:2", "add", "remove"]);
@@ -135,11 +137,65 @@ test("list pages through entries", async () => {
 
 test("history shows removed people with both reasons", async () => {
   const t = setup();
-  t.notebook.add("masha_k", "Позвала на день рождения");
-  t.notebook.remove("masha_k", "Уже поздравил");
+  const entry = t.notebook.add(login("masha_k"), "Позвала на день рождения");
+  t.notebook.remove(entry.id, "Уже поздравил");
   await t.send("/history");
   assert.match(t.lastReply().text, /Записали .*: Позвала на день рождения/);
   assert.match(t.lastReply().text, /Вычеркнули .*: Уже поздравил/);
+});
+
+test("a user picked in Telegram is added with id, login and name", async () => {
+  const t = setup();
+  await t.press("add");
+  await t.message({
+    users_shared: { request_id: 1, users: [{ user_id: 555, first_name: "Иван", last_name: "Петров" }] },
+  });
+  assert.match(t.lastReply().text, /Почему записываем 👤 Иван Петров/);
+  await t.send("Сосед");
+  assert.match(t.lastReply().text, /Telegram без логина: Иван Петров/);
+  assert.deepEqual(
+    { ...t.notebook.activeAs({ kind: "telegram", userId: 555 }), addedAt: undefined },
+    { id: 1, kind: "telegram", userId: 555, username: undefined, name: "Иван Петров", phone: undefined,
+      addedAt: undefined, addReason: "Сосед", removedAt: null, removeReason: null },
+  );
+  await t.message({ users_shared: { request_id: 1, users: [{ user_id: 555, first_name: "Иван" }] } });
+  assert.match(t.lastReply().text, /уже в тетрадочке/);
+});
+
+test("a phone asks for the name; a contact without Telegram is offline", async () => {
+  const t = setup();
+  await t.press("add");
+  await t.send("8 916 123-45-67");
+  assert.match(t.lastReply().text, /Как зовут человека с номером <code>\+79161234567<\/code>/);
+  await t.send("Маша");
+  await t.send("Соседка");
+  assert.match(t.lastReply().text, /Телефон: <code>\+79161234567<\/code>/);
+  assert.equal(t.notebook.list()[0].kind, "telegram");
+
+  await t.message({ contact: { phone_number: "+491512345678", first_name: "Hans" } });
+  await t.send("Коллега");
+  assert.match(t.lastReply().text, /Без Telegram: Hans/);
+  assert.equal(t.notebook.list()[1].kind, "offline");
+});
+
+test("a person without Telegram is added by name and removed by name", async () => {
+  const t = setup();
+  await t.press("add");
+  await t.send("✍️ Без Telegram");
+  assert.match(t.lastReply().text, /Как зовут/);
+  await t.send("Иван Петров");
+  await t.send("Сосед по даче");
+  assert.match(t.lastReply().text, /Без Telegram: Иван Петров/);
+  await t.send("/list");
+  assert.match(t.lastReply().text, /1\. ✍️ Иван Петров ·/);
+
+  await t.press("remove");
+  assert.deepEqual(t.lastReply().reply_markup.inline_keyboard[0][0].text, "✍️ Иван Петров");
+  await t.send("иван петров");
+  assert.match(t.lastReply().text, /За что вычёркиваем ✍️ Иван Петров/);
+  await t.send("Продал дачу");
+  await t.press("confirm:yes");
+  assert.match(t.lastReply().text, /<s>✍️ Иван Петров<\/s> · вычеркнуто/);
 });
 
 test("strangers get no reply", async () => {
